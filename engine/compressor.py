@@ -195,7 +195,7 @@ class Compressor:
             # The new symbol would need a new identity — use a placeholder
             # identity to estimate its bit length
             # (actual identity assigned at define time)
-            estimated_new_identity = self._vocab._next_learned_identity
+            estimated_new_identity = self._vocab.next_learned_identity
             new_token_cost = ZCEToken(
                 identity=estimated_new_identity,
                 depth=new_depth
