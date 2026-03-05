@@ -3,27 +3,43 @@ zce_core/core/vocabulary.py
 ===========================
 THE VOCABULARY. GROWS MONOTONICALLY. NEVER SHRINKS.
 
-The vocabulary is the accumulated set of self-locating symbols
-found so far. It is the system's understanding made concrete.
-
 Key invariants (enforced, never violated):
     1. Every symbol has a unique identity N
-    2. Every symbol's depth M is correct:
-           depth(s) = max(depth(component) for component in s.components) + 1
+    2. Every symbol's depth is correct:
+           depth(s) = max(depth(component) for component in components) + 1
            depth(s) = 0 for base primitives
     3. No symbol is ever removed (monotonic growth)
     4. DEFINE is always in the base vocabulary (immutable)
     5. Base primitives (depth=0) are immutable
+    6. No two symbols share an identity — ever
 
-The vocabulary is the implementation of the Self-Extension
-property (E) from SDTS. New symbols are defined via define(),
-which corresponds to the DEFINE meta-transition in the theory.
+IDENTITY ASSIGNMENT:
+    Base vocab (core):   N = 0..4  (DEFINE, SET, ADD, JIF, JMP)
+    Base vocab (domain): N = 5..N  via define(identity=N, components=[])
+    Learned symbols:     N = next_learned_identity, auto-incremented
 
-The Frozen Decoder Property is maintained here:
-    - define() adds data to the vocabulary
-    - define() does NOT modify the decoder
-    - The decoder reads the same three-step operation regardless
-      of how large the vocabulary grows
+    next_learned_identity starts at 256.
+    This reserves N=0..255 for hand-written base vocabularies.
+    Learned symbols get N=256, 257, 258...
+
+    Why 256? It's large enough for any reasonable domain base vocab
+    (256 primitive operations), and still gives compact learned
+    identities since N=256 -> bit_length = 256+depth+2 which is
+    large. BUT: in the math domain, base tokens have N=5..16
+    and the first learned token has N=256+0=256.
+
+    Wait — that would make learned tokens VERY expensive (258+ bits).
+    Better approach: track the high-water mark of explicitly assigned
+    identities and start learned symbols just above that.
+
+    ACTUAL STRATEGY: next_learned_identity = max(all assigned N) + 1.
+    This is updated every time define() is called with an explicit identity.
+    Learned symbols always get N just above the highest explicitly assigned N.
+    
+    For math domain: base N goes up to 16 (COMMA). So first learned = 17.
+    A learned token at N=17, depth=1: bit_length = 17+1+2 = 20 bits.
+    Three base tokens (avg N=10, depth=0): 3*(10+0+2) = 36 bits.
+    Savings = 36-20 = 16 bits per use. Compression appears clearly.
 """
 
 from __future__ import annotations
@@ -32,144 +48,76 @@ from typing import Any
 from .token import ZCEToken
 
 
-# ---------------------------------------------------------------------------
-# A symbol entry in the vocabulary
-# ---------------------------------------------------------------------------
-
 @dataclass
 class Symbol:
-    """
-    One entry in the vocabulary.
-
-    token       : the ZCE token identifying this symbol
-    name        : human-readable name (for readability — does not
-                  affect any computation, purely for inspection)
-    components  : list of token identities that compose this symbol
-                  (empty for base primitives)
-    action      : what this symbol does when executed
-                  (callable, or None for abstract symbols)
-    is_base     : True for symbols in V₀ — immutable primitives
-    description : human-readable description of what this symbol does
-    metadata    : any additional data the engine wants to store
-    """
+    """One entry in the vocabulary."""
     token       : ZCEToken
     name        : str
-    components  : list[int]         = field(default_factory=list)
-    action      : Any               = field(default=None)
-    is_base     : bool              = field(default=False)
-    description : str               = field(default="")
-    metadata    : dict              = field(default_factory=dict)
+    components  : list[int]  = field(default_factory=list)
+    action      : Any        = field(default=None)
+    is_base     : bool       = field(default=False)
+    description : str        = field(default="")
+    metadata    : dict       = field(default_factory=dict)
+    use_count   : int        = field(default=0)
 
     def __repr__(self) -> str:
         comp = f" <- {self.components}" if self.components else ""
         return f"Symbol({self.name!r}, {self.token}{comp})"
 
 
-# ---------------------------------------------------------------------------
-# Base vocabulary token identities
-# These are fixed. They correspond to N values (identity) in ZCE tokens.
-# ---------------------------------------------------------------------------
-
 class BaseTokens:
-    """
-    The immutable base vocabulary identities.
-    These N values are reserved and cannot be redefined.
+    """Reserved identity constants for the CORE base vocabulary."""
+    DEFINE  = 0
+    SET     = 1
+    ADD     = 2
+    JIF     = 3
+    JMP     = 4
 
-    The DEFINE token is the meta-transition. Its presence in the
-    base vocabulary is what makes the Frozen Decoder Property provable:
-    the mechanism for extension is itself immutable.
-    """
-    DEFINE  = 0   # meta-transition: extend the vocabulary
-    SET     = 1   # set a slot to a value
-    ADD     = 2   # add two slots
-    JIF     = 3   # conditional jump (immutable)
-    JMP     = 4   # unconditional jump (immutable)
-    # 5..N are available for user-defined base primitives
-    # Convention: base primitives use N=5..63
-    # Learned symbols use N=64 and above
+    IMMUTABLE = {DEFINE, JIF, JMP}
+    # Core base vocab uses N=0..4.
+    # Domain base vocabs use N=5..N via define(identity=N).
+    # Learned symbols start just above the highest assigned identity.
+    CORE_MAX = 4
 
-    IMMUTABLE = {DEFINE, JIF, JMP}   # cannot be redefined even by DEFINE
-    BASE_MAX  = 7   # N=5 is DEFINE_OP, 6-7 reserved for future base                    # highest N reserved for base vocab
-
-
-# ---------------------------------------------------------------------------
-# The Vocabulary
-# ---------------------------------------------------------------------------
 
 class Vocabulary:
     """
     The accumulated set of self-locating symbols.
-
-    Usage
-    -----
-    vocab = Vocabulary()
-    vocab.define(name="MUL", components=[1, 2], action=mul_fn, depth=1)
-    sym = vocab.lookup_by_name("MUL")
-    sym = vocab.lookup_by_identity(64)
+    Grows monotonically. Never shrinks.
     """
 
     def __init__(self) -> None:
-        # Map from identity (N) -> Symbol
-        self._symbols: dict[int, Symbol] = {}
-        # Map from name -> identity (N) for fast name lookup
-        self._names: dict[str, int] = {}
-        # Track the next available identity for learned symbols
-        self._next_learned_identity: int = BaseTokens.BASE_MAX + 1
-        # Total number of DEFINE operations applied
-        self._define_count: int = 0
-
-        # Install the base vocabulary
+        self._symbols   : dict[int, Symbol] = {}
+        self._names     : dict[str, int]    = {}
+        # High-water mark: the highest identity explicitly assigned so far.
+        # Learned symbols start at _hwm + 1.
+        self._hwm       : int = BaseTokens.CORE_MAX
+        self._define_count : int = 0
         self._install_base()
 
     # ------------------------------------------------------------------
-    # Base vocabulary installation
+    # Base vocabulary
     # ------------------------------------------------------------------
 
     def _install_base(self) -> None:
-        """
-        Install V₀ — the immutable base primitives.
-        Called once at construction. Never called again.
-        """
-        base_symbols = [
-            Symbol(
-                token       = ZCEToken(identity=BaseTokens.DEFINE, depth=0),
-                name        = "DEFINE",
-                components  = [],
-                is_base     = True,
-                description = "Meta-transition: extend the vocabulary. IMMUTABLE.",
-            ),
-            Symbol(
-                token       = ZCEToken(identity=BaseTokens.SET, depth=0),
-                name        = "SET",
-                components  = [],
-                is_base     = True,
-                description = "Set slot[dst] = value.",
-            ),
-            Symbol(
-                token       = ZCEToken(identity=BaseTokens.ADD, depth=0),
-                name        = "ADD",
-                components  = [],
-                is_base     = True,
-                description = "Set slot[dst] = slot[a] + slot[b].",
-            ),
-            Symbol(
-                token       = ZCEToken(identity=BaseTokens.JIF, depth=0),
-                name        = "JIF",
-                components  = [],
-                is_base     = True,
-                description = "If slot[cond] == 0: jump to offset. IMMUTABLE.",
-            ),
-            Symbol(
-                token       = ZCEToken(identity=BaseTokens.JMP, depth=0),
-                name        = "JMP",
-                components  = [],
-                is_base     = True,
-                description = "Unconditional jump to offset. IMMUTABLE.",
-            ),
+        base = [
+            (BaseTokens.DEFINE, "DEFINE", "Meta-transition: extend vocabulary. IMMUTABLE."),
+            (BaseTokens.SET,    "SET",    "Set slot[dst] = value."),
+            (BaseTokens.ADD,    "ADD",    "Set slot[dst] = slot[a] + slot[b]."),
+            (BaseTokens.JIF,    "JIF",    "If slot[cond]==0: jump. IMMUTABLE."),
+            (BaseTokens.JMP,    "JMP",    "Unconditional jump. IMMUTABLE."),
         ]
-        for sym in base_symbols:
-            self._symbols[sym.token.identity] = sym
-            self._names[sym.name] = sym.token.identity
+        for n, name, desc in base:
+            sym = Symbol(
+                token       = ZCEToken(identity=n, depth=0),
+                name        = name,
+                components  = [],
+                is_base     = True,
+                description = desc,
+            )
+            self._symbols[n] = sym
+            self._names[name] = n
+        # _hwm stays at CORE_MAX = 4 until domain base vocab is added
 
     # ------------------------------------------------------------------
     # DEFINE — the only way to add symbols
@@ -179,84 +127,59 @@ class Vocabulary:
         self,
         name        : str,
         components  : list[int],
-        action      : Any    = None,
-        description : str    = "",
-        metadata    : dict   = None,
-        identity    : int    = None,   # if None, auto-assigned
+        action      : Any  = None,
+        description : str  = "",
+        metadata    : dict = None,
+        identity    : int  = None,
     ) -> Symbol:
         """
-        Add a new symbol to the vocabulary. This is the DEFINE operation.
+        Add a new symbol. This is the DEFINE meta-transition.
 
-        The depth is computed automatically:
-            depth = max(depth(component) for component in components) + 1
-            depth = 0 if no components (should not happen for learned symbols)
+        Depth = max(depth(component) for c in components) + 1,
+                or 0 if components is empty (base primitive).
 
-        Parameters
-        ----------
-        name        : human-readable name
-        components  : list of identity values (N) of component symbols
-        action      : callable implementing this symbol's behavior
-        description : human-readable description
-        metadata    : arbitrary additional data
-        identity    : explicit identity N (for base vocab extensions only)
-                      if None, the next available learned identity is used
+        Identity assignment:
+            If identity is specified explicitly: use that N.
+                Also update the high-water mark so learned symbols
+                don't collide with it.
+            If identity is None (learned symbol):
+                Use _hwm + 1, increment _hwm.
 
-        Returns
-        -------
-        The newly created Symbol.
-
-        Raises
-        ------
-        ValueError  if name already exists, if identity is reserved/taken,
-                    or if any component is unknown.
+        Invariant: no two symbols ever share an identity.
         """
-        # Validate name
         if name in self._names:
             raise ValueError(f"Symbol {name!r} already defined")
 
-        # Validate and resolve components
-        for comp_id in components:
-            if comp_id not in self._symbols:
+        for c in components:
+            if c not in self._symbols:
                 raise ValueError(
-                    f"Component identity {comp_id} not in vocabulary "
-                    f"(cannot define {name!r})"
+                    f"Component identity {c} not in vocabulary "
+                    f"(defining {name!r})"
                 )
 
-        # Compute depth — this is the core invariant
-        if components:
-            max_component_depth = max(
-                self._symbols[c].token.depth for c in components
-            )
-            depth = max_component_depth + 1
-        else:
-            # Base primitive being added to V₀ — depth 0
-            depth = 0
+        depth = (max(self._symbols[c].token.depth for c in components) + 1
+                 if components else 0)
 
         # Assign identity
         if identity is not None:
-            # Explicit identity — validate it
             if identity in BaseTokens.IMMUTABLE:
-                raise ValueError(
-                    f"Cannot define symbol with identity {identity}: "
-                    f"that identity is immutable (DEFINE/JIF/JMP)"
-                )
+                raise ValueError(f"Identity {identity} is immutable")
             if identity in self._symbols:
                 raise ValueError(
                     f"Identity {identity} already taken by "
                     f"{self._symbols[identity].name!r}"
                 )
             n = identity
+            # Update high-water mark — learned symbols must stay above this
+            if n > self._hwm:
+                self._hwm = n
         else:
-            # Auto-assign next available learned identity
-            n = self._next_learned_identity
-            self._next_learned_identity += 1
+            # Auto-assign: first integer above the high-water mark
+            self._hwm += 1
+            n = self._hwm
 
-        # Create the token
-        token = ZCEToken(identity=n, depth=depth)
-
-        # Create the symbol
         sym = Symbol(
-            token       = token,
+            token       = ZCEToken(identity=n, depth=depth),
             name        = name,
             components  = list(components),
             action      = action,
@@ -264,31 +187,38 @@ class Vocabulary:
             description = description,
             metadata    = metadata or {},
         )
-
-        # Register
         self._symbols[n] = sym
         self._names[name] = n
         self._define_count += 1
-
         return sym
+
+    # ------------------------------------------------------------------
+    # Usage tracking
+    # ------------------------------------------------------------------
+
+    def record_use(self, identity: int) -> None:
+        if identity in self._symbols:
+            self._symbols[identity].use_count += 1
+
+    def usage_sorted(self) -> list[Symbol]:
+        return sorted(
+            self._symbols.values(),
+            key=lambda s: s.use_count,
+            reverse=True,
+        )
 
     # ------------------------------------------------------------------
     # Lookup
     # ------------------------------------------------------------------
 
     def lookup_by_identity(self, identity: int) -> Symbol | None:
-        """Return the symbol with the given identity N, or None."""
         return self._symbols.get(identity)
 
     def lookup_by_name(self, name: str) -> Symbol | None:
-        """Return the symbol with the given name, or None."""
         n = self._names.get(name)
-        if n is None:
-            return None
-        return self._symbols.get(n)
+        return self._symbols.get(n) if n is not None else None
 
     def lookup_by_token(self, token: ZCEToken) -> Symbol | None:
-        """Return the symbol for a given ZCE token, or None."""
         return self._symbols.get(token.identity)
 
     def has(self, name: str) -> bool:
@@ -302,33 +232,30 @@ class Vocabulary:
     # ------------------------------------------------------------------
 
     def symbols_at_depth(self, depth: int) -> list[Symbol]:
-        """Return all symbols at a given depth, sorted by identity."""
         return sorted(
             [s for s in self._symbols.values() if s.token.depth == depth],
-            key=lambda s: s.token.identity
+            key=lambda s: s.token.identity,
         )
 
     @property
     def max_depth(self) -> int:
-        """The current maximum depth in the vocabulary."""
         if not self._symbols:
             return 0
         return max(s.token.depth for s in self._symbols.values())
 
+    @property
+    def next_learned_identity(self) -> int:
+        """The N that the next auto-assigned symbol will receive."""
+        return self._hwm + 1
+
     # ------------------------------------------------------------------
-    # Stream operations — the vocabulary IS the understanding
+    # Stream
     # ------------------------------------------------------------------
 
     def to_token_stream(self) -> list[ZCEToken]:
-        """
-        Return the vocabulary as a ZCE token stream,
-        ordered by depth then identity.
-        This stream IS the accumulated understanding.
-        It is decodable by the frozen decoder.
-        """
         return sorted(
             [s.token for s in self._symbols.values()],
-            key=lambda t: (t.depth, t.identity)
+            key=lambda t: (t.depth, t.identity),
         )
 
     # ------------------------------------------------------------------
@@ -336,47 +263,40 @@ class Vocabulary:
     # ------------------------------------------------------------------
 
     def check_invariants(self) -> list[str]:
-        """
-        Check all vocabulary invariants.
-        Returns a list of violation strings (empty = all good).
-        """
-        violations: list[str] = []
-
+        violations = []
+        seen_identities: set[int] = set()
         for n, sym in self._symbols.items():
-            # Identity consistency
+            # Identity uniqueness
+            if n in seen_identities:
+                violations.append(f"Duplicate identity N={n}")
+            seen_identities.add(n)
+            # Token identity matches key
             if sym.token.identity != n:
                 violations.append(
-                    f"{sym.name}: token identity {sym.token.identity} "
-                    f"!= key {n}"
+                    f"{sym.name}: token.identity {sym.token.identity} != key {n}"
                 )
-
-            # Depth correctness
+            # Component existence and depth correctness
             if sym.components:
-                expected_depth = max(
-                    self._symbols[c].token.depth
-                    for c in sym.components
-                    if c in self._symbols
-                ) + 1
-                if sym.token.depth != expected_depth:
+                missing = [c for c in sym.components if c not in self._symbols]
+                if missing:
                     violations.append(
-                        f"{sym.name}: depth {sym.token.depth} "
-                        f"!= expected {expected_depth}"
+                        f"{sym.name}: missing components {missing}"
                     )
-
-            # Component existence
-            for c in sym.components:
-                if c not in self._symbols:
-                    violations.append(
-                        f"{sym.name}: component {c} not in vocabulary"
+                else:
+                    expected_depth = (
+                        max(self._symbols[c].token.depth for c in sym.components) + 1
                     )
-
-            # Base immutability
+                    if sym.token.depth != expected_depth:
+                        violations.append(
+                            f"{sym.name}: depth {sym.token.depth} "
+                            f"!= expected {expected_depth}"
+                        )
+            # Immutability
             if n in BaseTokens.IMMUTABLE and not sym.is_base:
                 violations.append(
-                    f"Identity {n} is immutable but symbol "
-                    f"{sym.name!r} is not marked as base"
+                    f"Identity {n} is immutable but symbol {sym.name!r} "
+                    f"is not marked as base"
                 )
-
         return violations
 
     # ------------------------------------------------------------------
@@ -387,25 +307,28 @@ class Vocabulary:
         return len(self._symbols)
 
     def __repr__(self) -> str:
-        return (
-            f"Vocabulary("
-            f"size={len(self)}, "
-            f"max_depth={self.max_depth}, "
-            f"defines={self._define_count})"
-        )
+        return (f"Vocabulary(size={len(self)}, "
+                f"max_depth={self.max_depth}, "
+                f"hwm={self._hwm})")
 
     def pretty_print(self) -> str:
-        """Human-readable vocabulary listing, ordered by depth."""
         lines = ["Vocabulary:"]
         for depth in range(self.max_depth + 1):
             syms = self.symbols_at_depth(depth)
-            if syms:
-                lines.append(f"  Depth {depth}:")
-                for s in syms:
-                    comp = f" <- [{', '.join(str(c) for c in s.components)}]" \
-                           if s.components else ""
-                    base = " [BASE]" if s.is_base else ""
-                    lines.append(
-                        f"    {s.token}  {s.name!r}{comp}{base}"
-                    )
+            if not syms:
+                continue
+            lines.append(f"  Depth {depth}:")
+            for s in syms:
+                comp_names = (
+                    [self._symbols[c].name for c in s.components
+                     if c in self._symbols]
+                    if s.components else []
+                )
+                base  = "  [BASE]" if s.is_base else ""
+                comp  = f"  =  {' ; '.join(comp_names)}" if comp_names else ""
+                uses  = f"  (used {s.use_count}x)" if s.use_count else ""
+                lines.append(
+                    f"    {s.token}  {s.name:<22} "
+                    f"[{s.token.bit_length}b]{base}{comp}{uses}"
+                )
         return "\n".join(lines)
